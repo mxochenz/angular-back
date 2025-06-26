@@ -147,9 +147,9 @@ app.put("/training/:id", jwtParser, (req, res) => {
 
   //validation des données
   if (
-    training.nom == null ||
-    training.nom.length < 3 ||
-    training.nom.length > 50 ||
+    training.name == null ||
+    training.name.length < 3 ||
+    training.name.length > 50 ||
     (training.description && training.description.length > 255)
   ) {
     return res.sendStatus(400); //bad request
@@ -217,7 +217,103 @@ app.delete("/training/:id", jwtParser, (req, res) => {
         (req.user.name == "validateur" && idCreateur == req.user.id)
       ) {
         connection.query(
-          "DELETE FROM training WHERE id = ?",
+          "DELETE FROM training WHERE training_id = ?",
+          [id],
+          (err, reponse) => {
+            if (err) {
+              console.debug(err);
+              return res.sendStatus(500);
+            }
+
+            console.log(reponse);
+
+            return res.sendStatus(204);
+          }
+        );
+      } else {
+        return res.sendStatus(401);
+      }
+    }
+  );
+});
+
+// routes pour les retards
+
+// recupération de tous les retards
+// on utilise jwtParser pour vérifier que l'utilisateur est connecté
+// et qu'il a les droits nécessaires pour accéder à cette ressource
+app.get("/retard", jwtParser, (req, res) => {
+  connection.query("SELECT * FROM lateness", (err, retards) => {
+    res.json(retards);
+  });
+});
+
+// recupération d'un retard par son id
+app.get("/retard/:id", jwtParser, (req, res) => {
+  const id = req.params.id;
+
+  connection.query(
+    "SELECT * FROM retard WHERE id = ?",
+    [id],
+    (err, retards) => {
+      if (err) {
+        console.debug(err);
+        return res.sendStatus(500);
+      }
+
+      if (retards.length == 0) {
+        return res.sendStatus(404);
+      }
+      res.json(retards[0]);
+    }
+  );
+});
+
+// ajout d'un retard
+app.post("/retard", jwtParser, (req, res) => {
+  const retard = req.body;
+
+  connection.query(
+    "INSERT INTO lateness (date_lateness, duration, user_id) VALUES (?,?,?)",
+    [retard.date_retard, retard.duration, retard.user_id],
+    (err, reponse) => {
+      if (err) {
+        console.debug(err);
+        return res.sendStatus(500);
+      }
+      res.json(retard);
+    }
+  );
+});
+
+// suppression d'un retard par son id
+app.delete("/retard/:id", jwtParser, (req, res) => {
+  const id = req.params.id;
+
+  connection.query(
+    "SELECT * FROM lateness WHERE id = ?",
+    [id],
+    (err, lateness) => {
+      if (err) {
+        console.debug(err);
+        return res.sendStatus(500);
+      }
+
+      //le retard n'existe pas
+      if (lateness.length == 0) {
+        return res.sendStatus(404);
+      }
+
+      const idCreateur = lateness[0].user_id;
+
+      //gestion des droits (req.user.nom = colonne nom de la table role)
+      //on n'effectue l'opération que si l'utilisateur est administrateur ou validateur
+      if (
+        req.user.name == "admin" ||
+        (req.user.name == "validateur" && idCreateur == req.user.id)
+      ) {
+        connection.query(
+          "DELETE FROM lateness WHERE id = ?",
           [id],
           (err, reponse) => {
             if (err) {
