@@ -9,6 +9,7 @@ const connection = require("./connection-db");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const { log } = require("console");
 
 // Filtrer les types de fichiers acceptés
 const fileFilter = (req, file, cb) => {
@@ -157,52 +158,67 @@ app.get("/training/:id", jwtParser, (req, res) => {
   );
 });
 
-app.post("/training", jwtParser, upload.single("image"), (req, res) => {
+app.post("/training", jwtParser, upload.single("image"), async (req, res) => {
   const training = req.body;
   const imagePath = req.file
     ? "/upload/" + req.file.filename
     : training.image || null;
 
-  // Validation étendue
-  if (
-    !training.title ||
-    training.title.length < 3 ||
-    training.title.length > 50 ||
-    !training.start_date ||
-    !training.end_date ||
-    isNaN(Date.parse(training.start_date)) ||
-    isNaN(Date.parse(training.end_date)) ||
-    (training.description && training.description.length > 255)
-  ) {
-    return res.sendStatus(400);
-  }
+  try {
+    // Vérifie que l'utilisateur connecté n'est pas un stagiaire
+    const [userRows] = await connection
+      .promise()
+      .query("SELECT role_id FROM users WHERE id = ?", [req.user.id]);
 
-  // Validation des dates
-  const startDate = new Date(training.start_date);
-  const endDate = new Date(training.end_date);
+    if (userRows.length === 0) {
+      return res.sendStatus(401); // utilisateur inexistant
+    }
 
-  if (startDate >= endDate) {
-    return res.status(400).json({
-      error: "La date de fin doit être après la date de début",
-    });
-  }
+    const roleId = userRows[0].role_id;
 
-  connection.query(
-    "SELECT id FROM training WHERE title = ?",
-    [training.title],
-    (err, results) => {
-      if (err) {
-        console.error(err);
-        return res.sendStatus(500);
-      }
+    if (roleId === 3) {
+      return res
+        .status(403)
+        .json({ error: "Les stagiaires ne peuvent pas créer de formations." });
+    }
 
-      if (results.length > 0) {
-        return res.sendStatus(409);
-      }
+    // Validation des données
+    if (
+      !training.title ||
+      training.title.length < 3 ||
+      training.title.length > 50 ||
+      !training.start_date ||
+      !training.end_date ||
+      isNaN(Date.parse(training.start_date)) ||
+      isNaN(Date.parse(training.end_date)) ||
+      (training.description && training.description.length > 255)
+    ) {
+      return res.sendStatus(400);
+    }
 
-      // Insertion avec tous les champs
-      connection.query(
-        "INSERT INTO training (title, description, start_date, end_date, image, user_id) VALUES (?,?,?,?,?,?)",
+    const startDate = new Date(training.start_date);
+    const endDate = new Date(training.end_date);
+
+    if (startDate >= endDate) {
+      return res.status(400).json({
+        error: "La date de fin doit être après la date de début",
+      });
+    }
+
+    // Vérifie si une formation avec le même titre existe déjà
+    const [existing] = await connection
+      .promise()
+      .query("SELECT id FROM training WHERE title = ?", [training.title]);
+
+    if (existing.length > 0) {
+      return res.sendStatus(409); // Conflit
+    }
+
+    // Insertion en base
+    const [insertResult] = await connection
+      .promise()
+      .query(
+        "INSERT INTO training (title, description, start_date, end_date, image, utilisateur_id) VALUES (?,?,?,?,?,?)",
         [
           training.title,
           training.description || null,
@@ -210,23 +226,21 @@ app.post("/training", jwtParser, upload.single("image"), (req, res) => {
           training.end_date,
           imagePath,
           req.user.id,
-        ],
-        (err, insertResult) => {
-          if (err) {
-            console.error(err);
-            return res.sendStatus(500);
-          }
-
-          // Renvoie la formation créée avec son ID
-          res.json({
-            id: insertResult.insertId,
-            ...training,
-            image: imagePath,
-          });
-        }
+        ]
       );
-    }
-  );
+
+    // Réponse avec la formation créée
+    res.status(201).json({
+      id: insertResult.insertId,
+      ...training,
+      image: imagePath,
+    });
+  } catch (err) {
+    console.error(err);
+    res
+      .status(500)
+      .json({ error: "Erreur lors de la création de la formation." });
+  }
 });
 
 app.put(
@@ -234,34 +248,45 @@ app.put(
   jwtParser,
   upload.single("image"),
   async (req, res) => {
-    try {
-      const id = req.params.id;
-      const training = req.body;
-      const existingImage = req.body.existingImage || "";
+    const id = req.params.id;
+    const training = req.body;
+    const existingImage = req.body.existingImage || "";
 
-      // 1. Récupérer l'ancien chemin depuis la base
+    try {
+      // Récupérer la formation
       const [rows] = await connection
         .promise()
-        .query("SELECT image FROM training WHERE id = ?", [id]);
+        .query("SELECT * FROM training WHERE id = ?", [id]);
 
-      const oldImagePath = rows[0]?.image;
-      let newImagePath = existingImage;
+      if (rows.length === 0) {
+        return res.sendStatus(404); // Formation non trouvée
+      }
 
-      // 2. Si nouveau fichier uploadé
-      if (req.file) {
-        newImagePath = "/upload/" + req.file.filename;
+      const trainingFromDb = rows[0];
+      const oldImagePath = trainingFromDb.image;
+      const idCreateur = trainingFromDb.user_id;
 
-        // 3. Supprimer l'ancienne image SI elle existe et n'est pas l'image par défaut
-        if (oldImagePath && oldImagePath !== "/upload/default.png") {
-          const fullPath = path.join(__dirname, "public", oldImagePath);
+      // 👤 Récupération du rôle de l'utilisateur connecté
+      const [userRows] = await connection
+        .promise()
+        .query("SELECT role_id FROM users WHERE id = ?", [req.user.id]);
 
-          if (fs.existsSync(fullPath)) {
-            fs.unlink(fullPath, (err) => {
-              if (err) console.error(`Échec suppression: ${fullPath}`, err);
-              else console.log(`Supprimé: ${fullPath}`);
-            });
-          }
-        }
+      if (userRows.length === 0) {
+        return res.sendStatus(401); // utilisateur inexistant
+      }
+
+      const roleId = userRows[0].role_id;
+
+      // Vérification des droits
+      if (
+        (roleId === 3 && req.user.id !== idCreateur) || // stagiaire ≠ propriétaire
+        (req.user.id !== idCreateur &&
+          !(
+            req.user.name === "admin" ||
+            (req.user.name === "validateur" && req.user.id === idCreateur)
+          ))
+      ) {
+        return res.sendStatus(403); // Interdit
       }
 
       // Validation des dates
@@ -274,11 +299,28 @@ app.put(
         });
       }
 
-      // 4. Mettre à jour la base
+      // Gérer l'image
+      let newImagePath = existingImage;
+
+      if (req.file) {
+        newImagePath = "/upload/" + req.file.filename;
+
+        if (oldImagePath && oldImagePath !== "/upload/default.png") {
+          const fullPath = path.join(__dirname, "public", oldImagePath);
+          if (fs.existsSync(fullPath)) {
+            fs.unlink(fullPath, (err) => {
+              if (err) console.error(`Erreur suppression: ${fullPath}`, err);
+              else console.log(`Image supprimée: ${fullPath}`);
+            });
+          }
+        }
+      }
+
+      // Mise à jour
       await connection
         .promise()
         .query(
-          "UPDATE training SET title=?, description=?, start_date=?, end_date=?, image=? WHERE id=?",
+          "UPDATE training SET title = ?, description = ?, start_date = ?, end_date = ?, image = ? WHERE id = ?",
           [
             training.title,
             training.description || null,
@@ -354,15 +396,37 @@ app.delete("/training/:id", jwtParser, (req, res) => {
 // routes pour les retards
 
 // GET tous les retards
-app.get("/retard", jwtParser, (req, res) => {
-  connection.query(
-    `SELECT lateness.*, users.email as user_email FROM lateness 
-     LEFT JOIN users ON users.id = lateness.user_id`,
-    (err, retards) => {
-      if (err) return res.sendStatus(500);
-      res.json(retards);
+app.get("/retard", jwtParser, async (req, res) => {
+  try {
+    // Récupérer le rôle de l'utilisateur connecté
+    const [userRows] = await connection
+      .promise()
+      .query("SELECT role_id FROM users WHERE id = ?", [req.user.id]);
+
+    if (userRows.length === 0) return res.sendStatus(401);
+
+    const roleId = userRows[0].role_id;
+
+    let query = `
+      SELECT lateness.*, users.email as user_email
+      FROM lateness
+      LEFT JOIN users ON users.id = lateness.user_id
+    `;
+    let params = [];
+
+    // Si stagiaire → filtrer ses propres retards
+    if (roleId === 3) {
+      query += " WHERE lateness.user_id = ?";
+      params.push(req.user.id);
     }
-  );
+
+    const [retards] = await connection.promise().query(query, params);
+
+    res.json(retards);
+  } catch (err) {
+    console.error(err);
+    res.sendStatus(500);
+  }
 });
 
 // GET un retard par id
@@ -413,39 +477,80 @@ app.post("/retard", jwtParser, (req, res) => {
 });
 
 // PUT modification d’un retard
-app.put("/retard/:id", jwtParser, (req, res) => {
+app.put("/retard/:id", jwtParser, async (req, res) => {
   const id = req.params.id;
-  const { date_lateness, duration, user_id } = req.body; // Destructuring
+  let { date_lateness, duration, user_id } = req.body;
 
-  if (!date_lateness || !duration || !user_id) return res.sendStatus(400);
+  // Vérification des champs requis (user_id sera éventuellement remplacé + validé ensuite)
+  if (!date_lateness || !duration) {
+    return res.status(400).json({ error: "Champs requis manquants" });
+  }
 
-  connection.query(
-    "SELECT role_id FROM users WHERE id = ?",
-    [user_id],
-    (err, results) => {
-      if (err) return res.sendStatus(500);
-      if (results.length === 0) return res.sendStatus(404);
+  try {
+    //  Récupérer l'ancien retard
+    const [retardRows] = await connection
+      .promise()
+      .query("SELECT * FROM lateness WHERE id = ?", [id]);
 
-      const roleId = results[0].role_id; // Accès correct
+    if (retardRows.length === 0) return res.sendStatus(404);
 
-      if (roleId !== 3) {
-        return res.status(400).json({
-          error: "Seuls les stagiaires peuvent avoir des retards déclarés",
-        });
-      }
+    const retard = retardRows[0];
 
-      // UPDATE à l'intérieur du callback
-      connection.query(
-        "UPDATE lateness SET date_lateness=?, duration=?, user_id=? WHERE id=?",
-        [date_lateness, duration, user_id, id],
-        (err, result) => {
-          if (err) return res.sendStatus(500);
-          if (result.affectedRows === 0) return res.sendStatus(404);
-          res.json({ id, ...req.body });
-        }
-      );
+    //  Récupération du rôle de l'utilisateur connecté
+    const [userRows] = await connection
+      .promise()
+      .query("SELECT role_id FROM users WHERE id = ?", [req.user.id]);
+
+    if (userRows.length === 0) return res.sendStatus(401);
+
+    const roleId = userRows[0].role_id;
+
+    //  Droits de modification
+    const isOwner = req.user.id === retard.user_id;
+    const isAdmin = req.user.name === "admin";
+    const isValidator = req.user.name === "validateur" && isOwner;
+
+    if (!isOwner && !isAdmin && !isValidator) {
+      return res.sendStatus(403);
     }
-  );
+
+    //  Si stagiaire, forcer le user_id à son propre ID
+    if (roleId === 3) {
+      user_id = req.user.id;
+    }
+
+    // Vérifier que le user_id est bien un stagiaire
+    const [targetUserRows] = await connection
+      .promise()
+      .query("SELECT role_id FROM users WHERE id = ?", [user_id]);
+
+    if (targetUserRows.length === 0) {
+      return res.status(404).json({ error: "Utilisateur cible non trouvé" });
+    }
+
+    if (targetUserRows[0].role_id !== 3) {
+      return res.status(400).json({
+        error: "Seuls les stagiaires peuvent avoir des retards déclarés",
+      });
+    }
+
+    // Mise à jour
+    const [updateResult] = await connection
+      .promise()
+      .query(
+        "UPDATE lateness SET date_lateness = ?, duration = ?, user_id = ? WHERE id = ?",
+        [date_lateness, duration, user_id, id]
+      );
+
+    if (updateResult.affectedRows === 0) {
+      return res.sendStatus(404);
+    }
+
+    res.json({ id, date_lateness, duration, user_id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erreur serveur lors de la mise à jour" });
+  }
 });
 
 // DELETE suppression d’un retard (admin/validateur uniquement)
